@@ -1,0 +1,32 @@
+#!/bin/sh
+# redis-cli 转发器：配合同目录的 redis-tui.sh 使用
+#
+# Windows 版 Git Bash 和 WSL 内部都能用：
+#   - 在 WSL 里：直接执行真正的 redis-cli
+#   - 在 Git Bash 里：经 wsl.exe 转发给 WSL 里的 redis-cli
+#
+# 真正的 redis-cli 是用 Redis 官方安装器装在 WSL (Ubuntu-22.04) 里的：
+#   curl -fsSL https://packages.redis.io/redis-cli/install.sh | sh
+# 以后如果换成原生 redis-cli.exe，删掉本文件即可。
+
+REAL="/usr/local/bin/redis-cli"
+
+# 在 WSL 里直接执行
+if [ "$(uname -s)" = "Linux" ]; then
+    exec "$REAL" "$@"
+fi
+
+# 在 Git Bash 里经 wsl.exe 转发：
+#   WSLENV           Windows 的环境变量默认不会传进 WSL，密码 (REDISCLI_AUTH) 必须显式带过去
+#   MSYS_NO_PATHCONV 阻止 Git Bash 把以 / 开头的参数（比如 Key）改写成 Windows 路径
+WSLENV_NEW="${REDISCLI_AUTH+REDISCLI_AUTH}${WSLENV:+:$WSLENV}"
+[ -n "$WSLENV_NEW" ] && export WSLENV="$WSLENV_NEW"
+MSYS_NO_PATHCONV=1
+export MSYS_NO_PATHCONV
+# 默认把标准输入和 wsl.exe 隔开（</dev/null）：否则 wsl.exe 会把父进程的输入读走，
+# 脚本自己的 read 就读不到用户输入了。
+# 只有批量模式例外：redis-tui.sh 会设置 REDISCLI_BATCH=1，并把要执行的命令从标准输入送进来
+if [ -n "${REDISCLI_BATCH:-}" ]; then
+    exec wsl.exe -d Ubuntu-22.04 --exec "$REAL" "$@"
+fi
+exec wsl.exe -d Ubuntu-22.04 --exec "$REAL" "$@" </dev/null
