@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run redis-cli over a private Unix socket backed by a verified TLS connection."""
+"""Run redis-cli over a private Unix socket with verified TLS or a selected DB."""
 
 import argparse
 import os
@@ -69,10 +69,13 @@ def forward_reply(header, reader, output):
 
 
 class RedisConnection:
-    def __init__(self, context, host, port, server_name, username, password):
+    def __init__(self, context, host, port, server_name, username, password, database):
         host = host.strip("[]")
-        with socket.create_connection((host, port), timeout=5) as raw:
-            self.socket = context.wrap_socket(raw, server_hostname=server_name or host)
+        if context is None:
+            self.socket = socket.create_connection((host, port), timeout=5)
+        else:
+            with socket.create_connection((host, port), timeout=5) as raw:
+                self.socket = context.wrap_socket(raw, server_hostname=server_name or host)
         self.socket.settimeout(30)
         self.reader = self.socket.makefile("rb")
         try:
@@ -83,6 +86,11 @@ class RedisConnection:
                 parts.append(password.encode("utf-8", "surrogateescape"))
                 if self.send(encode_command(*parts)) != b"+OK\r\n":
                     raise OSError("Redis authentication failed")
+            # redis-cli can continue after -n fails. Gate commands on SELECT here.
+            if database:
+                reply = self.send(encode_command(b"SELECT", str(database).encode()))
+                if reply != b"+OK\r\n":
+                    raise OSError(reply.decode("utf-8", "replace").strip() or "Redis rejected SELECT")
         except BaseException:
             self.close()
             raise
@@ -128,18 +136,20 @@ def main():
     parser.add_argument("--ca", default="")
     parser.add_argument("--server-name", default="")
     parser.add_argument("--follow", action="store_true")
+    parser.add_argument("--plain", action="store_true")
+    parser.add_argument("--database", type=int, default=0)
     options, cli_arguments = parser.parse_known_args()
     if cli_arguments[:1] == ["--"]:
         cli_arguments = cli_arguments[1:]
     if os.name != "posix":
-        raise OSError("Bash TLS requires a POSIX environment, such as WSL")
+        raise OSError("This connection requires a POSIX environment, such as WSL")
 
     environment = os.environ.copy()
     password = environment.pop("REDISCLI_AUTH", None)
-    context = ssl.create_default_context(cafile=options.ca or None)
+    context = None if options.plain else ssl.create_default_context(cafile=options.ca or None)
 
     def connect(host, port):
-        return RedisConnection(context, host, port, options.server_name, options.user, password)
+        return RedisConnection(context, host, port, options.server_name, options.user, password, options.database)
 
     with tempfile.TemporaryDirectory(prefix="redis-tui-tls-", dir="/tmp") as directory:
         path = os.path.join(directory, "redis.sock")
@@ -176,5 +186,5 @@ if __name__ == "__main__":
     try:
         sys.exit(main())
     except (OSError, ValueError, subprocess.TimeoutExpired) as error:
-        print(f"TLS: {error}", file=sys.stderr)
+        print(f"Redis: {error}", file=sys.stderr)
         sys.exit(1)

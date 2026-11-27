@@ -1,6 +1,6 @@
 ﻿<#
 .SYNOPSIS
-    Redis 集群管理工具，命令行版，纯 PowerShell。
+    Redis 单机与集群管理工具，纯 PowerShell。
 .DESCRIPTION
     单文件，自己实现 Redis 协议，不依赖 redis-cli、bash 或 WSL。
       1  查询单个 Key
@@ -37,6 +37,8 @@ $script:UseColor = -not [Console]::IsOutputRedirected -and -not $env:NO_COLOR -a
 $script:SearchBudget = $null
 $script:Secret = ''             # 仅在当前进程内用于 AUTH
 $script:LoginProfile = $null
+$script:RedisMode = 'cluster'
+$script:Database = 0
 $script:ProfileDirectory = $env:REDIS_TUI_CONFIG_DIR
 if (-not $script:ProfileDirectory) {
     if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) {
@@ -121,13 +123,19 @@ function Show-Header([int]$Width = (Get-ConsoleWidth)) {
     Write-Host ''
     Write-C '  ' -NoNewline
     Write-C ' REDIS ' White -BackgroundColor DarkRed -NoNewline
-    Write-C '  集群管理' White
+    $title = '  集群管理'
+    $location = $script:LoginNode
+    if ($script:RedisMode -eq 'standalone') {
+        $title = '  单机管理'
+        $location = "DB $script:Database · $location"
+    }
+    Write-C $title White
     if ($script:LoginNode) {
         Write-C '  ' -NoNewline
         if ($script:AllowWrites) { Write-C '[可写]' Black -BackgroundColor Yellow -NoNewline }
         else { Write-C '[只读]' White -BackgroundColor DarkBlue -NoNewline }
         Write-C '   节点 ' Gray -NoNewline
-        Write-Fit $script:LoginNode White ($Width - 17)
+        Write-Fit $location White ($Width - 17)
         if ($script:LoginProfile.Name -or $script:LoginProfile.Tls) {
             $label = $script:LoginProfile.Name
             if (-not $label) { $label = '临时连接' }
@@ -504,7 +512,7 @@ public static class RedisTuiTls {
     }
 }
 
-function New-Connection([string]$Node) {
+function New-Connection([string]$Node, [int]$Database = $script:Database) {
     $sep = $Node.LastIndexOf(':')
     $server = $Node.Substring(0, $sep).Trim('[', ']')
     $port = [int]$Node.Substring($sep + 1)
@@ -538,6 +546,10 @@ function New-Connection([string]$Node) {
                 if ([string]$reply -ne 'OK') { throw 'unexpected authentication reply' }
             }
             catch { throw 'Redis 认证失败，请核对 ACL 用户名和密码。' }
+        }
+        if ($Database -ne 0) {
+            $reply = Invoke-OnConnection $conn @('SELECT', [string]$Database)
+            if ($reply -ne 'OK') { throw 'Redis 未确认 SELECT' }
         }
         return $conn
     }
@@ -647,9 +659,14 @@ function Invoke-Pipeline {
 
 # ============ 集群 ============
 function Get-ClusterNodes {
+    $nodes = New-Object 'System.Collections.Generic.List[object]'
+    if ($script:RedisMode -eq 'standalone') {
+        $nodes.Add([pscustomobject]@{ Id = 'standalone'; Addr = $script:LoginNode; IsMaster = $true; MasterId = '-'; Connected = $true })
+        return ,$nodes
+    }
+
     # 解析 CLUSTER NODES：Id / Addr / IsMaster / MasterId / Connected
     $text = [string](Invoke-Redis -Command 'CLUSTER' -Arguments @('NODES'))
-    $nodes = New-Object 'System.Collections.Generic.List[object]'
     foreach ($line in ($text -split "`n")) {
         $line = $line.Trim()
         if (-not $line) { continue }
@@ -729,11 +746,28 @@ function Save-ConnectionProfile($Settings, [bool]$Replace) {
     finally { [IO.File]::Delete($temp) }
 }
 
+function Get-RedisMode {
+    try {
+        $info = [string](Invoke-Redis -Command 'INFO' -Arguments @('server'))
+        if ($info -match '(?m)^redis_mode:standalone\r?$') { return 'standalone' }
+        if ($info -match '(?m)^redis_mode:cluster\r?$') { return 'cluster' }
+    } catch { }
+    try {
+        $null = Invoke-Redis -Command 'CLUSTER' -Arguments @('INFO')
+    }
+    catch {
+        if ($_.Exception.Message -like '*cluster support disabled*') { return 'standalone' }
+    }
+    return 'cluster'
+}
+
 function Connect-LoginProfile($Settings, [string]$Secret) {
     $previousNode = $script:LoginNode
     $previousSecret = $script:Secret
     $previousSettings = $script:LoginProfile
     $previousConnections = $script:Connections
+    $previousDatabase = $script:Database
+    $script:Database = 0
     $script:LoginNode = "$($Settings.HostName):$($Settings.Port)"
     $script:Secret = $Secret
     $script:LoginProfile = $Settings
@@ -749,6 +783,7 @@ function Connect-LoginProfile($Settings, [string]$Secret) {
         $script:Secret = $previousSecret
         $script:LoginProfile = $previousSettings
         $script:Connections = $previousConnections
+        $script:Database = $previousDatabase
         Write-C ('  × 连接失败: ' + $_.Exception.Message) Red
         Pause-Script
         return $false
@@ -756,10 +791,35 @@ function Connect-LoginProfile($Settings, [string]$Secret) {
     foreach ($conn in $previousConnections.Values) {
         try { $conn.Client.Close() } catch { }
     }
+    $script:RedisMode = Get-RedisMode
     $script:AllowWrites = $false
     $script:LastPattern = ''
     Write-C '  √ 连接成功' Green
     return $true
+}
+
+function Switch-Database {
+    $text = Read-Line '  DB 编号 [非负整数，回车取消] > '
+    if (-not $text -or -not $text.Trim()) { return }
+    $text = $text.Trim()
+    $database = 0
+    if ($text -notmatch '^[0-9]{1,10}$' -or -not [int]::TryParse($text, [ref]$database)) {
+        Write-C '  请输入有效的 DB 编号。' Yellow
+        Pause-Script
+        return
+    }
+    if ($database -eq $script:Database) { return }
+    try { $connection = New-Connection $script:LoginNode $database }
+    catch {
+        Write-C ('  × 切换 DB 失败: ' + (Convert-ToSafeText $_.Exception.Message)) Red
+        Pause-Script
+        return
+    }
+    Close-Connections
+    $script:Connections[$script:LoginNode] = $connection
+    $script:Database = $database
+    $script:AllowWrites = $false
+    $script:LastPattern = ''
 }
 
 function Switch-WriteMode {
@@ -1083,6 +1143,51 @@ function Show-Collection([string]$Key, [string]$Type, $Ttl, $Size) {
     }
 }
 
+function Format-JsonPreview([string]$Value) {
+    if ($Value -notmatch '^\s*[\[{]') { return $null }
+
+    # 只验证和缩进，保留字符串转义和数字原文。
+    $null = ConvertFrom-Json -InputObject $Value -ErrorAction Stop
+    $tokens = [regex]::Matches($Value, '"(?:\\.|[^"\\])*"|[{}\[\],:]|[^\s{}\[\],:]+')
+    $formatted = [Text.StringBuilder]::new()
+    $depth = 0
+    $previous = ''
+    foreach ($match in $tokens) {
+        $token = $match.Value
+        if ($token -in @('}', ']')) {
+            $depth--
+            if ($previous -notin @('{', '[')) { $null = $formatted.AppendLine().Append('  ' * $depth) }
+        }
+        elseif ($previous -in @('{', '[', ',')) { $null = $formatted.AppendLine().Append('  ' * $depth) }
+        elseif ($previous -eq ':') { $null = $formatted.Append(' ') }
+        if ($token -cin @('NaN', 'Infinity', '-Infinity') -or $depth -gt 100) { return $null }
+        $null = $formatted.Append($token)
+        if ($token -in @('{', '[')) { $depth++ }
+        $previous = $token
+    }
+    return $formatted.ToString()
+}
+
+function Show-StringPreview([string]$Key) {
+    $limit = 65536
+    $length = $null
+    try { $length = [long](Invoke-Redis -Command 'STRLEN' -Arguments @($Key)) } catch { }
+    $value = [string](Invoke-Redis -Command 'GETRANGE' -Arguments @($Key, '0', [string]($limit - 1)))
+    if ($null -eq $length) { Write-C "  预览最多 $limit B · 总长度不可用" Yellow }
+    elseif ($length -gt $limit) { Write-C "  预览前 $limit B · 总计 $length B" Yellow }
+    elseif ($length -lt $limit -and [Text.Encoding]::UTF8.GetByteCount($value) -lt $limit) {
+        $formatted = $null
+        try { $formatted = Format-JsonPreview $value } catch { }
+        if ($formatted) {
+            $value = $formatted
+            Write-C '  JSON 格式化预览' Gray
+        }
+    }
+    $value = [regex]::Replace($value.Replace("`r", ''), '[\x00-\x08\x0B-\x0C\x0E-\x1F\x7F-\x9F]', '?')
+    if ($value) { Write-Host -Object $value }
+    else { Write-C '  (空 String)' Gray }
+}
+
 function Show-KeyDetail([string]$Key) {
     $width = Get-ConsoleWidth
     try {
@@ -1106,8 +1211,7 @@ function Show-KeyDetail([string]$Key) {
             Show-DetailHeader $width $Key $type $ttl $size
             Write-C '  值' Cyan
             if ($type -eq 'string') {
-                $value = Invoke-Redis -Command 'GET' -Arguments @($Key)
-                Write-Host -Object ([string]$value)
+                Show-StringPreview $Key
             }
             else { Write-C ('  (不支持显示类型: ' + $type + ')') Gray }
         }
@@ -1944,7 +2048,10 @@ function Show-MonitorSnapshot($Previous) {
     $ok = $null
     $assigned = $null
     try {
-        $info = [string](Invoke-Redis -Command 'CLUSTER' -Arguments @('INFO'))
+        $info = ''
+        if ($script:RedisMode -eq 'cluster') {
+            $info = [string](Invoke-Redis -Command 'CLUSTER' -Arguments @('INFO'))
+        }
         foreach ($line in ($info -split "`n")) {
             $pair = ($line.Trim() -split ':', 2)
             if ($pair.Count -ne 2) { continue }
@@ -2009,10 +2116,13 @@ function Show-MonitorSnapshot($Previous) {
     # ---- 标题与汇总 ----
     Write-MLine ''
     $title = '  Redis 集群监控'
+    if ($script:RedisMode -eq 'standalone') { $title = '  Redis 单机监控' }
     $stamp = $now.ToString('yyyy-MM-dd HH:mm:ss')
     $left = $width - 1 - (Get-TextWidth $stamp) - 2
     Write-MLine ($title + (' ' * [Math]::Max(1, $left - (Get-TextWidth $title))) + $stamp) White
-    Write-MLine ('  集群状态 ' + $clusterState + '    槽位 ' + $slotsText + '    节点 ' + $stats.Count + ' 个 (' + $masterCount + ' 主 ' + ($stats.Count - $masterCount) + ' 从)') Cyan
+    if ($script:RedisMode -eq 'cluster') {
+        Write-MLine ('  集群状态 ' + $clusterState + '    槽位 ' + $slotsText + '    节点 ' + $stats.Count + ' 个 (' + $masterCount + ' 主 ' + ($stats.Count - $masterCount) + ' 从)') Cyan
+    }
     $totalKeys = 0L
     $totalMem = 0L
     $totalClients = 0L
@@ -2026,7 +2136,9 @@ function Show-MonitorSnapshot($Previous) {
         $totalClients += [long]$s.Clients
         if ($s.IsMaster) { $totalOps += [long]$s.OpsPerSec }
     }
-    Write-MLine ('  主节点合计: {0} 个键 · {1} · 每秒 {2} 条命令' -f (Format-Count $totalKeys), (Format-Size $totalMem), (Format-Count $totalOps)) Gray
+    $summary = '主节点合计'
+    if ($script:RedisMode -eq 'standalone') { $summary = '实例合计' }
+    Write-MLine ('  {0}: {1} 个键 · {2} · 每秒 {3} 条命令' -f $summary, (Format-Count $totalKeys), (Format-Size $totalMem), (Format-Count $totalOps)) Gray
     Write-MLine ('  全部节点客户端 {0}    可连接 {1} / {2}' -f (Format-Count $totalClients), $reachable, $stats.Count) Gray
 
     $problem = @{}
@@ -2116,7 +2228,8 @@ function Invoke-Overview {
     Clear-Screen
     Show-Header
     Write-Host ''
-    Write-C '  集群概览' Yellow
+    if ($script:RedisMode -eq 'standalone') { Write-C '  单机概览' Yellow }
+    else { Write-C '  集群概览' Yellow }
     $interval = 2
     $text = Read-Line '  刷新间隔秒数 (回车 = 2，输入 0 只看一次): '
     if ($null -eq $text) { return }
@@ -2207,7 +2320,9 @@ function Invoke-Monitor {
         Show-Header $width
         Write-Host ''
         Write-C '  Redis 监控' Cyan
-        Write-MenuItem $width 1 '集群概览' '内存、连接、吞吐和主从状态'
+        $overview = '集群概览'
+        if ($script:RedisMode -eq 'standalone') { $overview = '单机概览' }
+        Write-MenuItem $width 1 $overview '内存、连接、吞吐和主从状态'
         Write-MenuItem $width 2 '慢查询日志' '按时间查看各节点的慢命令'
         Write-MenuItem $width 3 '命令与错误统计' '命令次数、耗时和错误'
         Write-MenuItem $width 4 '大 Key 排行' '按节点和前缀采样内存占用'
@@ -2971,10 +3086,18 @@ function Invoke-MainMenu {
                 Write-MenuItem $width $sessionKeys[$i] $sessionItems[$i]
             }
         }
+        $last = 5
+        if ($script:RedisMode -eq 'standalone') {
+            $indent = 0
+            if ($paired) { $indent = $left }
+            if ($indent) { Write-C (' ' * $indent) -NoNewline }
+            Write-MenuItem ($width - $indent) 6 '切换 DB'
+            $last = 6
+        }
         Write-Host ''
         if ($message) { Write-C ('  ' + $message) Yellow }
         $message = ''
-        $choice = Read-Line '  选择 [0–5] > '
+        $choice = Read-Line "  选择 [0–$last] > "
         if ($null -eq $choice) { return }
         $choice = $choice.Trim()
 
@@ -2983,12 +3106,16 @@ function Invoke-MainMenu {
         elseif ($choice -eq '3') { Invoke-Monitor }
         elseif ($choice -eq '4') { $null = Invoke-Login }
         elseif ($choice -eq '5') { Switch-WriteMode }
+        elseif ($choice -eq '6') {
+            if ($script:RedisMode -eq 'standalone') { Switch-Database }
+            else { $message = '集群使用 DB 0。' }
+        }
         elseif ($choice -eq '0') {
             Clear-Screen
             Write-C '  再见' Green
             return
         }
-        else { $message = '请输入 0 到 5。' }
+        else { $message = "请输入 0 到 $last。" }
     }
 }
 

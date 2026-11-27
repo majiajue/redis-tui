@@ -1,0 +1,45 @@
+name: redis-tui-demo
+
+services:
+  redis:
+    image: redis:7.4-alpine
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    ports:
+      - "127.0.0.1:${REDIS_TUI_DEMO_PORT:-16380}:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 1s
+      timeout: 2s
+      retries: 15
+
+  seed:
+    image: redis:7.4-alpine
+    depends_on:
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./demo/seed.sh:/demo/seed.sh:ro
+    entrypoint: ["sh", "/demo/seed.sh"]
+
+  tui:
+    build:
+      context: .
+      dockerfile: demo/Dockerfile
+    depends_on:
+      seed:
+        condition: service_completed_successfully
+    command: ["redis", "6379"]
+    stdin_open: true
+    tty: true
+
+  powershell:
+    profiles: [powershell]
+    build:
+      context: .
+      dockerfile: demo/Dockerfile.powershell
+    depends_on:
+      seed:
+        condition: service_completed_successfully
+    command: ["redis", "6379"]
+    stdin_open: true
+    tty: true

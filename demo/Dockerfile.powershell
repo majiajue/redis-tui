@@ -1,0 +1,17 @@
+ARG TARGETARCH
+FROM scratch AS powershell-amd64
+ADD --checksum=sha256:e261cabc91c78a9afe8d1e5f24731ab0d38204735ab2ec94b0af55102652e10d https://github.com/PowerShell/PowerShell/releases/download/v7.6.10/powershell-7.6.10-linux-x64.tar.gz /powershell.tar.gz
+
+FROM scratch AS powershell-arm64
+ADD --checksum=sha256:439432cdecf4418413b9a8f547e3ab4d9b40e8e4258913ec3d15fc92c67a9235 https://github.com/PowerShell/PowerShell/releases/download/v7.6.10/powershell-7.6.10-linux-arm64.tar.gz /powershell.tar.gz
+
+FROM powershell-${TARGETARCH} AS powershell-archive
+
+FROM mcr.microsoft.com/dotnet/runtime-deps:10.0-noble
+RUN --mount=type=bind,from=powershell-archive,source=/powershell.tar.gz,target=/tmp/powershell.tar.gz \
+    mkdir -p /opt/powershell \
+    && tar -xzf /tmp/powershell.tar.gz -C /opt/powershell \
+    && chmod +x /opt/powershell/pwsh
+WORKDIR /app
+COPY powershell/redis-tui.ps1 ./
+ENTRYPOINT ["/opt/powershell/pwsh", "-NoLogo", "-NoProfile", "-File", "/app/redis-tui.ps1"]

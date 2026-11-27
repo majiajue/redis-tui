@@ -1,5 +1,5 @@
 #!/bin/bash
-# redis-tui.sh - Redis 集群管理工具，命令行版（bash + redis-cli）
+# redis-tui.sh - Redis 单机与集群管理工具（bash + redis-cli）
 #
 # 用法: ./redis-tui.sh [host] [port] [password]
 #       ./redis-tui.sh --profile "连接名"（交互输入密码）
@@ -27,6 +27,7 @@ fi
 
 CONFIG_HOST=""; CONFIG_PORT=""; CONFIG_PASS=""
 CONFIG_NAME=""; CONFIG_USER=""; CONFIG_TLS=0; CONFIG_CA=""; CONFIG_TLS_NAME=""
+CONFIG_MODE=cluster; CONFIG_DB=0
 PROFILE_DIR="${REDIS_TUI_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/redis-tui/connections}"
 ALLOW_WRITES=0
 LAST_PATTERN=""
@@ -147,16 +148,21 @@ rule() {
 
 show_header() {
     local width="${1:-$(tty_width)}" mode='[只读]' mode_color="$READ_BADGE" profile_label
+    local title='集群管理' location="$CONFIG_HOST:$CONFIG_PORT"
+    if [ "$CONFIG_MODE" = standalone ]; then
+        title='单机管理'
+        location="DB $CONFIG_DB · $location"
+    fi
     if [ "$ALLOW_WRITES" = 1 ]; then mode='[可写]'; mode_color="$WRITE_BADGE"; fi
     echo
     printf '  '
     sayn ' REDIS ' "$BRAND"
-    say '  集群管理' "$WHITE"
+    say "  $title" "$WHITE"
     if [ -n "$CONFIG_HOST" ]; then
         printf '  '
         sayn "$mode" "$mode_color"
         sayn '   节点 ' "$GRAY"
-        say_fit "$CONFIG_HOST:$CONFIG_PORT" "$WHITE" $(( width - 17 ))
+        say_fit "$location" "$WHITE" $(( width - 17 ))
         if [ -n "$CONFIG_NAME" ] || [ "$CONFIG_TLS" = 1 ]; then
             profile_label="${CONFIG_NAME:-临时连接}"
             [ "$CONFIG_TLS" != 1 ] || profile_label+=" · TLS"
@@ -231,9 +237,11 @@ exec_redis_cli() {
     local -a options=()
     if [ -n "$CONFIG_USER$CONFIG_PASS" ]; then export REDISCLI_AUTH="$CONFIG_PASS"
     else unset REDISCLI_AUTH; fi
-    if [ "$CONFIG_TLS" = 1 ]; then
+    if [ "$CONFIG_TLS" = 1 ] || [ "$CONFIG_DB" != 0 ]; then
         if [ "${1:-}" = -c ]; then options+=(--follow); shift; fi
         options+=(--host "$2" --port "$4" --user "$CONFIG_USER" --ca "$CONFIG_CA" --server-name "$CONFIG_TLS_NAME")
+        [ "$CONFIG_TLS" = 1 ] || options+=(--plain)
+        [ "$CONFIG_DB" = 0 ] || options+=(--database "$CONFIG_DB")
         shift 4
         exec python3 "$SELF_DIR/redis-tls.py" --cli "$REDIS_CLI" "${options[@]}" -- "$@"
     else
@@ -244,7 +252,11 @@ exec_redis_cli() {
 
 run_redis_cli() ( exec_redis_cli "$@" )
 
-rex() { run_redis_cli -c -h "$CONFIG_HOST" -p "$CONFIG_PORT" "$@" 2>/dev/null; }
+rex() {
+    local -a options=()
+    [ "$CONFIG_MODE" = standalone ] || options+=(-c)
+    run_redis_cli "${options[@]}" -h "$CONFIG_HOST" -p "$CONFIG_PORT" "$@" 2>/dev/null
+}
 rex_node() { run_redis_cli -h "$1" -p "$2" "${@:3}" 2>/dev/null; }
 # 批量执行：标准输入里每行一条命令，回复按原始格式输出。只用于回复是单行的命令。
 # REDISCLI_BATCH 告诉 redis-cli 转发器：这次要把标准输入带过去
@@ -288,10 +300,19 @@ batch() {
 
 # ============ 登录 ============
 set_login() {
-    local r
+    local r info
     say '  正在测试连接...' "$DARKGRAY"
     if r=$(run_redis_cli -h "$CONFIG_HOST" -p "$CONFIG_PORT" PING 2>&1) && [ "$r" = PONG ]; then
+        CONFIG_MODE=cluster
+        info=$(rex INFO server)
+        if [[ "$info" = *redis_mode:standalone* ]]; then
+            CONFIG_MODE=standalone
+        elif [[ "$info" != *redis_mode:cluster* ]]; then
+            info=$(rex CLUSTER INFO)
+            [[ "$info" != *'cluster support disabled'* ]] || CONFIG_MODE=standalone
+        fi
         ALLOW_WRITES=0
+        LAST_PATTERN=''
         say '  √ 连接成功' "$GREEN"
         return 0
     fi
@@ -300,9 +321,38 @@ set_login() {
     return 1
 }
 
+switch_database() {
+    local db reply expected=OK
+    local -a command=()
+    read_line '  DB 编号 [非负整数，回车取消] > ' || return
+    trim "$REPLY"; db="$REPLY"
+    [ -n "$db" ] || return
+    if ! [[ "$db" =~ ^[0-9]{1,10}$ ]] || [ "$(( 10#$db ))" -gt 2147483647 ]; then
+        say '  请输入有效的 DB 编号。' "$YELLOW"
+    else
+        db=$(( 10#$db ))
+        [ "$db" != "$CONFIG_DB" ] || return
+        if [ "$db" = 0 ]; then command=(PING); expected=PONG
+        else command=(SELECT "$db"); fi
+        if [ "$db" != 0 ] && ! command -v python3 >/dev/null 2>&1; then
+            say '  切换 DB 需要 Python 3。' "$RED"
+        elif reply=$(CONFIG_DB=0 run_redis_cli -h "$CONFIG_HOST" -p "$CONFIG_PORT" "${command[@]}" 2>&1) && [ "$reply" = "$expected" ]; then
+            CONFIG_DB=$db
+            ALLOW_WRITES=0
+            LAST_PATTERN=''
+            return
+        else
+            say "  × 切换 DB 失败: ${reply//[[:cntrl:]]/?}" "$RED"
+        fi
+    fi
+    pause
+}
+
 toggle_write_mode() {
+    local target="$CONFIG_HOST:$CONFIG_PORT"
     if [ "$ALLOW_WRITES" = 1 ]; then ALLOW_WRITES=0; return; fi
-    say "  启用写入 · $CONFIG_HOST:$CONFIG_PORT" "$YELLOW"
+    [ "$CONFIG_MODE" != standalone ] || target+=" · DB $CONFIG_DB"
+    say "  启用写入 · $target" "$YELLOW"
     read_line '  输入 WRITE 确认 > ' || return 0
     if [ "$REPLY" = WRITE ]; then ALLOW_WRITES=1; fi
 }
@@ -362,12 +412,14 @@ read_redis_password() {
 
 connect_profile() {
     local name="$1" host="$2" port="$3" username="$4" tls="$5" ca="$6" tls_name="$7" password="$8"
-    local -a previous=("$CONFIG_NAME" "$CONFIG_HOST" "$CONFIG_PORT" "$CONFIG_USER" "$CONFIG_TLS" "$CONFIG_CA" "$CONFIG_TLS_NAME" "$CONFIG_PASS")
+    local -a previous=("$CONFIG_NAME" "$CONFIG_HOST" "$CONFIG_PORT" "$CONFIG_USER" "$CONFIG_TLS" "$CONFIG_CA" "$CONFIG_TLS_NAME" "$CONFIG_PASS" "$CONFIG_DB")
     CONFIG_NAME="$name"; CONFIG_HOST="$host"; CONFIG_PORT="$port"; CONFIG_USER="$username"
     CONFIG_TLS="$tls"; CONFIG_CA="$ca"; CONFIG_TLS_NAME="$tls_name"; CONFIG_PASS="$password"
-    if set_login; then LAST_PATTERN=''; return 0; fi
+    CONFIG_DB=0
+    if set_login; then return 0; fi
     CONFIG_NAME=${previous[0]}; CONFIG_HOST=${previous[1]}; CONFIG_PORT=${previous[2]}; CONFIG_USER=${previous[3]}
     CONFIG_TLS=${previous[4]}; CONFIG_CA=${previous[5]}; CONFIG_TLS_NAME=${previous[6]}; CONFIG_PASS=${previous[7]}
+    CONFIG_DB=${previous[8]}
     return 1
 }
 
@@ -665,9 +717,74 @@ show_collection() {
     done
 }
 
+pretty_json() {
+    python3 -c '
+import json, re, sys
+
+try:
+    value = sys.stdin.buffer.read().decode("utf-8").strip()
+    json.loads(value)
+except (ValueError, RecursionError):
+    sys.exit(1)
+if not value.startswith(("{", "[")):
+    sys.exit(1)
+tokens = re.findall(r"\"(?:\\.|[^\"\\])*\"|[{}\[\],:]|[^\s{}\[\],:]+", value)
+depth = 0
+previous = ""
+parts = []
+for token in tokens:
+    if token in ("}", "]"):
+        depth -= 1
+        if previous not in ("{", "["):
+            parts.append("\n" + "  " * depth)
+    elif previous in ("{", "[", ","):
+        parts.append("\n" + "  " * depth)
+    elif previous == ":":
+        parts.append(" ")
+    if token in ("NaN", "Infinity", "-Infinity") or depth > 100:
+        sys.exit(1)
+    parts.append(token)
+    depth += token in ("{", "[")
+    previous = token
+sys.stdout.buffer.write("".join(parts).encode("utf-8"))
+'
+}
+
+show_string_preview() {
+    local key="$1" limit=65536 length response encoded value formatted
+    length=$(rex --raw STRLEN "$key")
+    if ! response=$(rex --csv GETRANGE "$key" 0 "$(( limit - 1 ))") || [[ "$response" != \"*\" ]]; then
+        say '  无法读取 String 预览。' "$RED"
+        return
+    fi
+    # redis-cli CSV 的转义兼容 printf %b，双引号和 NUL 单独处理。
+    encoded=$(printf '%s\n' "${response:1:${#response}-2}" | sed 's/\\\\/\\x5c/g; s/\\"/\\x22/g; s/\\x00/\\x01/g')
+    value=$(printf '%b' "$encoded")
+    if [[ "$length" =~ ^[0-9]+$ ]]; then
+        if [ "$length" -gt "$limit" ]; then
+            say "  预览前 $limit B · 总计 $length B" "$YELLOW"
+        elif [ "$length" -lt "$limit" ] && [ "${#value}" -lt "$limit" ] &&
+            command -v python3 >/dev/null 2>&1 && formatted=$(printf '%s' "$value" | pretty_json); then
+            value="$formatted"
+            say '  JSON 格式化预览' "$GRAY"
+        fi
+    else
+        say "  预览最多 $limit B · 总长度不可用" "$YELLOW"
+    fi
+    if [ -n "$value" ]; then
+        printf '%s\n' "$value" | sed $'s/\r$//; s/\xc2[\x80-\x9f]/?/g' | tr '\000-\010\013-\037\177' '?'
+    else
+        say '  (空 String)' "$GRAY"
+    fi
+}
+
 show_detail() {
     local key="$1" type ttl size width
-    type=$(rex TYPE "$key")
+    if ! type=$(rex TYPE "$key"); then
+        say '  无法读取 Key 类型，请检查连接与权限。' "$RED"
+        pause
+        return
+    fi
     if [ -z "$type" ] || [ "$type" = none ]; then
         clear_screen
         show_header
@@ -684,7 +801,7 @@ show_detail() {
         width=$(tty_width)
         detail_header "$width" "$key" "$type" "$ttl" "$size"
         say '  值' "$ACCENT"
-        if [ "$type" = string ]; then rex GET "$key"
+        if [ "$type" = string ]; then show_string_preview "$key"
         else say "  (不支持显示类型: $type)" "$GRAY"; fi
     fi
     echo
@@ -868,6 +985,10 @@ search_cli() {
 
 read_primary_nodes() {
     primary_nodes=()
+    if [ "$CONFIG_MODE" = standalone ]; then
+        primary_nodes=("$CONFIG_HOST:$CONFIG_PORT")
+        return 0
+    fi
     search_cli '' -c -h "$CONFIG_HOST" -p "$CONFIG_PORT" --raw CLUSTER NODES || return 1
     mapfile -t primary_nodes < <(awk '$3 ~ /(^|,)master(,|$)/ && $3 !~ /noaddr|handshake/ { sub(/@.*/, "", $2); print $2 }' "$search_file")
     [ "${#primary_nodes[@]}" -gt 0 ]
@@ -1535,7 +1656,12 @@ monitor_snapshot() {
     local tk tm to tc
     local total_keys=0 total_mem=0 total_clients=0 total_ops=0 master_count=0 addrw=15
 
-    text=$(rex CLUSTER NODES)
+    if [ "$CONFIG_MODE" = standalone ]; then
+        text="standalone $CONFIG_HOST:$CONFIG_PORT master -"
+    else
+        text=$(rex CLUSTER NODES)
+        cinfo=$(rex CLUSTER INFO)
+    fi
     MID2ADDR=()
     while read -r id addr flags masterid ping pong epoch state; do
         [ -n "$addr" ] || continue
@@ -1563,7 +1689,6 @@ monitor_snapshot() {
         return
     fi
 
-    cinfo=$(rex CLUSTER INFO)
     while IFS= read -r line; do
         line=${line%$'\r'}
         case "$line" in
@@ -1571,7 +1696,7 @@ monitor_snapshot() {
             cluster_slots_ok:*) okn=${line#*:} ;;
             cluster_slots_assigned:*) asn=${line#*:} ;;
         esac
-    done <<< "$cinfo"
+    done <<< "${cinfo:-}"
     if [[ "$okn" =~ ^[0-9]+$ ]] && [[ "$asn" =~ ^[0-9]+$ ]]; then
         fmt_count "$okn"; tk="$REPLY"
         fmt_count "$asn"; slots="$tk / $REPLY"
@@ -1645,16 +1770,23 @@ monitor_snapshot() {
     mout '' "$GRAY"
     stamp=$(date '+%Y-%m-%d %H:%M:%S')
     title='  Redis 集群监控'
+    [ "$CONFIG_MODE" != standalone ] || title='  Redis 单机监控'
     left=$(( MW - 1 - ${#stamp} - 2 - $(str_width "$title") ))
     [ "$left" -lt 1 ] && left=1
     printf -v line '%s%*s%s' "$title" "$left" '' "$stamp"
     mout "$line" "$WHITE"
-    mout "  集群状态 $cstate    槽位 $slots    节点 ${#MN_LIST[@]} 个 ($master_count 主 $(( ${#MN_LIST[@]} - master_count )) 从)" "$CYAN"
+    if [ "$CONFIG_MODE" = cluster ]; then
+        mout "  集群状态 $cstate    槽位 $slots    节点 ${#MN_LIST[@]} 个 ($master_count 主 $(( ${#MN_LIST[@]} - master_count )) 从)" "$CYAN"
+    fi
     fmt_count "$total_keys"; tk="$REPLY"
     fmt_size "$total_mem"; tm="$REPLY"
     fmt_count "$total_ops"; to="$REPLY"
     fmt_count "$total_clients"; tc="$REPLY"
-    mout "  主节点合计: $tk 个键 · $tm · 每秒 $to 条命令" "$GRAY"
+    if [ "$CONFIG_MODE" = standalone ]; then
+        mout "  实例合计: $tk 个键 · $tm · 每秒 $to 条命令" "$GRAY"
+    else
+        mout "  主节点合计: $tk 个键 · $tm · 每秒 $to 条命令" "$GRAY"
+    fi
     mout "  全部节点客户端 $tc    可连接 $reach / ${#MN_LIST[@]}" "$GRAY"
 
     # ---- 表 1：概览 ----
@@ -1696,7 +1828,7 @@ monitor_overview() {
     clear_screen
     show_header
     echo
-    say '  集群概览' "$YELLOW"
+    if [ "$CONFIG_MODE" = standalone ]; then say '  单机概览' "$YELLOW"; else say '  集群概览' "$YELLOW"; fi
     read_line '  刷新间隔秒数 (回车 = 2，输入 0 只看一次): ' || return 0
     [[ "$REPLY" =~ ^[0-9]+$ ]] && interval=$(( 10#$REPLY ))
     if [ "$interval" -gt 0 ]; then
@@ -1739,6 +1871,10 @@ monitor_nodes() {
     local text id addr flags masterid ping pong epoch state
     local -a masters=() replicas=()
     MN_LIST=(); MN_ISMASTER=()
+    if [ "$CONFIG_MODE" = standalone ]; then
+        MN_LIST=("$CONFIG_HOST:$CONFIG_PORT"); MN_ISMASTER=(1)
+        return 0
+    fi
     text=$(rex CLUSTER NODES) || return 1
     while read -r id addr flags masterid ping pong epoch state; do
         [ -n "$addr" ] || continue
@@ -1753,14 +1889,16 @@ monitor_nodes() {
 }
 
 monitor_menu() {
-    local choice width message=''
+    local choice width message='' overview
     while true; do
         width=$(tty_width)
         clear_screen
         show_header "$width"
         echo
         say '  Redis 监控' "$ACCENT"
-        menu_item "$width" 1 '集群概览' '内存、连接、吞吐和主从状态'
+        overview='集群概览'
+        [ "$CONFIG_MODE" != standalone ] || overview='单机概览'
+        menu_item "$width" 1 "$overview" '内存、连接、吞吐和主从状态'
         menu_item "$width" 2 '慢查询日志' '按时间查看各节点的慢命令'
         menu_item "$width" 3 '命令与错误统计' '命令次数、耗时和错误'
         menu_item "$width" 4 '大 Key 排行' '按节点和前缀采样内存占用'
@@ -2562,7 +2700,7 @@ menu_item() {
 }
 
 main_menu() {
-    local choice width message='' write_label left paired i
+    local choice width message='' write_label left paired i last db_indent
     local -a tools=('查询单个 Key' '搜索 Key' 'Redis 监控')
     local -a descriptions=('类型、过期、大小和值' '关键词、类型和前缀' '健康状态、慢查询与错误')
     local -a session_keys=(4 5 0) session_items=()
@@ -2575,6 +2713,7 @@ main_menu() {
         [ "$ALLOW_WRITES" = 1 ] && write_label='恢复只读'
         session_items=('连接配置' "$write_label" '退出')
         left=$width; paired=0
+        last=5; db_indent=0
         if [ "$width" -ge 90 ]; then
             left=54; paired=1
             pad '  浏览和诊断' "$left" 0; sayn "$REPLY" "$ACCENT"
@@ -2595,10 +2734,16 @@ main_menu() {
                 menu_item "$width" "${session_keys[$i]}" "${session_items[$i]}" ''
             done
         fi
+        if [ "$CONFIG_MODE" = standalone ]; then
+            [ "$paired" = 0 ] || db_indent=$left
+            printf '%*s' "$db_indent" ''
+            menu_item "$(( width - db_indent ))" 6 '切换 DB' ''
+            last=6
+        fi
         echo
         [ -n "$message" ] && say "  $message" "$YELLOW"
         message=''
-        read_line '  选择 [0–5] > ' || return 0
+        read_line "  选择 [0–$last] > " || return 0
         choice="$REPLY"
         trim "$choice"; choice="$REPLY"
         case "$choice" in
@@ -2607,8 +2752,9 @@ main_menu() {
             3) monitor_menu ;;
             4) do_login ;;
             5) toggle_write_mode ;;
+            6) if [ "$CONFIG_MODE" = standalone ]; then switch_database; else message='集群使用 DB 0。'; fi ;;
             0) clear_screen; say '  再见' "$GREEN"; return 0 ;;
-            *) message='请输入 0 到 5。' ;;
+            *) message="请输入 0 到 $last。" ;;
         esac
     done
 }
